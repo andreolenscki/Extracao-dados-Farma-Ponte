@@ -5,26 +5,24 @@ import time
 import sys
 import pandas as pd
 from bs4 import BeautifulSoup
+from tqdm.asyncio import tqdm  # Importação específica para asyncio
 
 # --- Configurações ---
 BASE_URL = "https://www.farmaponte.com.br/saude/medicamentos/?p={}"
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
 }
-CONCURRENCY_LIMIT = 15 # Quantidade de requisições simultâneas
+CONCURRENCY_LIMIT = 40 
 
-# --- Funções Auxiliares de Limpeza ---
+# --- Funções Auxiliares de Extração (Mantidas conforme seu original) ---
 
 def limpar_preco(texto):
     if not texto: return "0"
-    # Remove R$, espaços e converte formato decimal se necessário
     return texto.replace("R$", "").replace("\xa0", "").replace(" ", "").strip()
 
 def limpar_porcentagem(texto):
     if not texto: return "0"
     return texto.replace("%", "").replace("-", "").replace(" ", "").strip()
-
-# --- Funções de Extração ---
 
 def achar_EAN_gtin(soup):
     try:
@@ -45,6 +43,7 @@ def achar_nome(soup):
         return meta["content"].strip() if meta else "NA"
     except: return "NA"
 
+# ... (As outras funções achar_marca, achar_preco, etc., permanecem iguais)
 def achar_marca(soup):
     try: return soup.select_one(".title_marca").get_text(strip=True)
     except: return "NA"
@@ -82,17 +81,14 @@ def achar_cashback(soup):
 def achar_apenas_pix(soup):
     try:
         selo_pix = soup.select_one(".seal-desconto-pix")
-        if selo_pix and "PIX" in selo_pix.get_text(strip=True).upper():
-            return "Sim"
-        return "Não"
+        return "Sim" if selo_pix and "PIX" in selo_pix.get_text(strip=True).upper() else "Não"
     except: return "Não"
 
 def achar_promo_volume(soup):
     try:
         for b in soup.find_all('b'):
             texto = b.get_text(strip=True)
-            if "A PARTIR DE" in texto.upper():
-                return " ".join(texto.split()) 
+            if "A PARTIR DE" in texto.upper(): return " ".join(texto.split()) 
         return "NA"
     except: return "NA"
 
@@ -101,20 +97,16 @@ def achar_promo_volume(soup):
 async def processar_produto(session, url, semaphore):
     async with semaphore:
         try:
-            async with session.get(url, timeout=20) as response:
+            async with session.get(url, timeout=25) as response:
                 if response.status != 200: return None
-                
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
-
-                nome = achar_nome(soup)
-                ean = achar_EAN_gtin(soup)
                 
-                item = {
+                return {
                     "Categoria": "Medicamentos",
-                    "Nome": nome,
+                    "Nome": achar_nome(soup),
                     "Marca": achar_marca(soup),
-                    "EAN": ean,
+                    "EAN": achar_EAN_gtin(soup),
                     "Preço sem desconto": achar_preco_antes_desconto(soup),
                     "Desconto (%)": achar_desconto(soup),
                     "Preço com Desconto": achar_preco(soup),
@@ -124,11 +116,7 @@ async def processar_produto(session, url, semaphore):
                     "Promoção por Volume": achar_promo_volume(soup),
                     "Link": url
                 }
-
-                print(f" [OK] {nome[:30]:<30} | EAN: {ean}")
-                return item
-        except Exception as e:
-            print(f" [ERRO] {url}: {e}")
+        except:
             return None
 
 async def main():
@@ -136,67 +124,58 @@ async def main():
     pagina = 1
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-        # 1. Coleta de Links (Paginação)
-        print("=== INICIANDO MAPEAMENTO DE PRODUTOS ===")
+        # 1. Coleta de Links
+        print("=== MAPEANDO PÁGINAS ===")
         while True:
             try:
                 async with session.get(BASE_URL.format(pagina)) as response:
                     if response.status != 200: break
-                    
                     html = await response.text()
                     soup = BeautifulSoup(html, "html.parser")
                     produtos = soup.select(".item-product")
                     
-                    if not produtos:
-                        print(f"\nFim da paginação na página {pagina-1}.")
-                        break
+                    if not produtos: break
                     
                     for p in produtos:
-                        try: 
-                            link_tag = p.select_one(".title a")
-                            if link_tag:
-                                href = link_tag['href']
-                                link_completo = f"https://www.farmaponte.com.br{href}" if href.startswith("/") else href
-                                links_produtos.append(link_completo)
-                        except: continue
+                        link_tag = p.select_one(".title a")
+                        if link_tag:
+                            href = link_tag['href']
+                            links_produtos.append(f"https://www.farmaponte.com.br{href}" if href.startswith("/") else href)
                     
-                    print(f"Lendo página {pagina}... Total: {len(links_produtos)} links", end="\r")
+                    print(f"Lendo página {pagina}... Total acumulado: {len(links_produtos)} links", end="\r")
                     pagina += 1
-            except Exception as e:
-                print(f"\nErro na paginação: {e}")
-                break
+            except: break
 
-        print(f"\n\nTotal de produtos encontrados: {len(links_produtos)}")
+        print(f"\n\nTotal para processar: {len(links_produtos)}")
         print("-" * 50)
 
-        # 2. Extração de Detalhes
+        # 2. Extração com TQDM
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
         tarefas = [processar_produto(session, link, semaphore) for link in links_produtos]
         
-        resultados = await asyncio.gather(*tarefas)
-        dados_finais = [r for r in resultados if r is not None]
+        dados_finais = []
+        # tqdm.as_completed permite ver a barra de progresso conforme as tasks terminam
+        for f in tqdm.as_completed(tarefas, total=len(tarefas), desc="Extraindo Produtos"):
+            item = await f
+            if item:
+                dados_finais.append(item)
 
-    # 3. Exportação de Dados
+    # 3. Exportação
     if dados_finais:
         df = pd.DataFrame(dados_finais)
         df.drop_duplicates(subset=["Link"], inplace=True)
-        
-        nome_arquivo = "medicamentos_farmaponte.xlsx"
-        df.to_excel(nome_arquivo, index=False)
-        
-        print("\n" + "="*50)
-        print(f"Sucesso! {len(df)} produtos salvos em '{nome_arquivo}'.")
-        print("="*50)
+        df.to_excel("medicamentos_farmaponte.xlsx", index=False)
+        print(f"\nConcluído! {len(df)} produtos salvos.")
     else:
-        print("\nNenhum dado foi extraído.")
+        print("\nNenhum dado coletado.")
 
 if __name__ == "__main__":
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     inicio = time.time()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    
-    
-    
-    print(f"\nTempo total de execução: {time.time() - inicio:.2f}s")
+    print(f"\nTempo total: {time.time() - inicio:.2f}s")
