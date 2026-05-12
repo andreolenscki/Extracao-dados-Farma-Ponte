@@ -5,17 +5,17 @@ import time
 import sys
 import pandas as pd
 from bs4 import BeautifulSoup
-from tqdm.asyncio import tqdm  # Importação específica para asyncio
+from tqdm.asyncio import tqdm
 
-# --- Configurações ---
 BASE_URL = "https://www.farmaponte.com.br/saude/medicamentos/?p={}"
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive'
 }
-CONCURRENCY_LIMIT = 40 
+CONCURRENCY_LIMIT = 15
 
-# --- Funções Auxiliares de Extração (Mantidas conforme seu original) ---
-
+#funções
 def limpar_preco(texto):
     if not texto: return "0"
     return texto.replace("R$", "").replace("\xa0", "").replace(" ", "").strip()
@@ -24,6 +24,7 @@ def limpar_porcentagem(texto):
     if not texto: return "0"
     return texto.replace("%", "").replace("-", "").replace(" ", "").strip()
 
+#Extração
 def achar_EAN_gtin(soup):
     try:
         scripts = soup.find_all('script', type='application/ld+json')
@@ -43,7 +44,6 @@ def achar_nome(soup):
         return meta["content"].strip() if meta else "NA"
     except: return "NA"
 
-# ... (As outras funções achar_marca, achar_preco, etc., permanecem iguais)
 def achar_marca(soup):
     try: return soup.select_one(".title_marca").get_text(strip=True)
     except: return "NA"
@@ -92,15 +92,17 @@ def achar_promo_volume(soup):
         return "NA"
     except: return "NA"
 
-# --- Processamento Assíncrono ---
-
+#ASync
 async def processar_produto(session, url, semaphore):
     async with semaphore:
         try:
-            async with session.get(url, timeout=25) as response:
+            # Timeout mais curto para não travar o script em páginas lentas
+            async with session.get(url, timeout=15) as response:
                 if response.status != 200: return None
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+                
+                #lxml
+                content = await response.read()
+                soup = BeautifulSoup(content, "lxml")
                 
                 return {
                     "Categoria": "Medicamentos",
@@ -121,20 +123,24 @@ async def processar_produto(session, url, semaphore):
 
 async def main():
     links_produtos = []
-    pagina = 1
-
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        # 1. Coleta de Links
-        print("=== MAPEANDO PÁGINAS ===")
+    
+    connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCY_LIMIT, ssl=False)
+    
+    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
+        #Link
+        pagina = 1
+        print("=== MAPEANDO PÁGINAS (FASE 1) ===")
         while True:
             try:
-                async with session.get(BASE_URL.format(pagina)) as response:
+                async with session.get(BASE_URL.format(pagina), timeout=15) as response:
                     if response.status != 200: break
-                    html = await response.text()
-                    soup = BeautifulSoup(html, "html.parser")
+                    
+                    soup = BeautifulSoup(await response.read(), "lxml")
                     produtos = soup.select(".item-product")
                     
-                    if not produtos: break
+                    if not produtos:
+                        print(f"\nFim da paginação na página {pagina-1}.")
+                        break
                     
                     for p in produtos:
                         link_tag = p.select_one(".title a")
@@ -144,18 +150,19 @@ async def main():
                     
                     print(f"Lendo página {pagina}... Total acumulado: {len(links_produtos)} links", end="\r")
                     pagina += 1
-            except: break
+            except:
+                break
 
-        print(f"\n\nTotal para processar: {len(links_produtos)}")
+        print(f"\n\nTotal de produtos únicos encontrados: {len(set(links_produtos))}")
+        print("=== EXTRAINDO DETALHES (FASE 2) ===")
         print("-" * 50)
 
-        # 2. Extração com TQDM
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-        tarefas = [processar_produto(session, link, semaphore) for link in links_produtos]
+        links_unicos = list(set(links_produtos))
+        tarefas = [processar_produto(session, link, semaphore) for link in links_unicos]
         
         dados_finais = []
-        # tqdm.as_completed permite ver a barra de progresso conforme as tasks terminam
-        for f in tqdm.as_completed(tarefas, total=len(tarefas), desc="Extraindo Produtos"):
+        for f in tqdm.as_completed(tarefas, total=len(tarefas), desc="Progresso"):
             item = await f
             if item:
                 dados_finais.append(item)
@@ -163,11 +170,19 @@ async def main():
     # 3. Exportação
     if dados_finais:
         df = pd.DataFrame(dados_finais)
-        df.drop_duplicates(subset=["Link"], inplace=True)
-        df.to_excel("medicamentos_farmaponte.xlsx", index=False)
-        print(f"\nConcluído! {len(df)} produtos salvos.")
+        colunas = ["Categoria", "Nome", "Marca", "EAN", "Preço sem desconto", 
+                   "Desconto (%)", "Preço com Desconto", "Preço Pix", 
+                   "Cashback", "Apenas PIX", "Promoção por Volume", "Link"]
+        df = df[colunas]
+        
+        arquivo = "medicamentos_farmaponte_final.xlsx"
+        df.to_excel(arquivo, index=False)
+        print("\n" + "="*50)
+        print(f"SUCESSO! {len(df)} produtos extraídos.")
+        print(f"Arquivo salvo como: {arquivo}")
+        print("="*50)
     else:
-        print("\nNenhum dado coletado.")
+        print("\nNenhum dado foi extraído com sucesso.")
 
 if __name__ == "__main__":
     if sys.platform == 'win32':
@@ -177,5 +192,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
-    print(f"\nTempo total: {time.time() - inicio:.2f}s")
+        print("\nProcesso interrompido manualmente.")
+    
+    print(f"\nTempo total de execução: {time.time() - inicio:.2f}s")
